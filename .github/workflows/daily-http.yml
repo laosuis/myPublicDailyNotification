@@ -1,0 +1,110 @@
+name: Daily HTTP Request
+
+on:
+  schedule:
+    # GitHub 的 cron 一律按 UTC 计算。北京时间 10:00 = UTC 02:00。
+    # 中国无夏令时，全年固定这一个时间即可。
+    - cron: "0 2 * * *"
+  # 允许在 Actions 页面手动点 Run 触发，方便首次验证
+  workflow_dispatch:
+
+# 防止上一次还没跑完又起一个
+concurrency:
+  group: daily-http-request
+  cancel-in-progress: false
+
+jobs:
+  post:
+    name: Send POST request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 环境声明：只有声明了，才读得到该环境的 Environment secrets。
+    # 现在配置都放 config.env，这一行可以保留（无害），也可以整行删掉。
+    # 注意：如果该环境开了 Required reviewers，定时任务会挂起等审批。
+    environment: production
+    steps:
+      # 必须检出仓库，否则读不到 config.env
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Send JSON payload
+        env:
+          TZ: Asia/Shanghai
+          # 兜底来源：config.env 里没写的项，才用这里的 Secret / Variable。
+          # 不配置也没关系，只是对应项为空。
+          SECRET_TARGET_URL: ${{ secrets.TARGET_URL }}
+          SECRET_AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          SECRET_PAYLOAD_BODY: ${{ vars.PAYLOAD_BODY }}
+        run: |
+          set -euo pipefail
+
+          echo "触发时间：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          # ---- 1. 读配置：与 workflow 同目录的 config.env ----
+          # 先切到仓库根目录，保证相对路径稳定；再按顺序找配置文件。
+          cd "${GITHUB_WORKSPACE:-$PWD}"
+
+          CONFIG_FILE=""
+          for candidate in ".github/workflows/config.env" "config.env"; do
+            if [ -f "$candidate" ]; then
+              CONFIG_FILE="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$CONFIG_FILE" ]; then
+            echo "已读取 $CONFIG_FILE"
+            set -a
+            # shellcheck disable=SC1091
+            . "./$CONFIG_FILE"
+            set +a
+          else
+            echo "::warning::未找到 config.env（已查找 .github/workflows/config.env 与仓库根目录），回落到 Secrets / Variables"
+          fi
+
+          TARGET_URL="${TARGET_URL:-${SECRET_TARGET_URL:-}}"
+          AUTH_TOKEN="${AUTH_TOKEN:-${SECRET_AUTH_TOKEN:-}}"
+          PAYLOAD_BODY="${PAYLOAD_BODY:-${SECRET_PAYLOAD_BODY:-我的内容}}"
+
+          # ---- 2. 校验 ----
+          if [ -z "$TARGET_URL" ]; then
+            echo "::error::TARGET_URL 为空，请检查 .github/workflows/config.env"
+            exit 1
+          fi
+          case "$TARGET_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::TARGET_URL 必须以 http:// 或 https:// 开头，当前值：$TARGET_URL"
+              exit 1
+              ;;
+          esac
+
+          # ---- 3. 组装请求 ----
+          echo "目标地址：$TARGET_URL"
+          if [ -n "$AUTH_TOKEN" ]; then
+            echo "鉴权：已携带 Bearer token（长度 ${#AUTH_TOKEN}，不打印内容）"
+          else
+            echo "鉴权：未携带"
+          fi
+
+          headers=(-H "User-Agent: GitHubActions-DailyPing/1.0")
+          if [ -n "$AUTH_TOKEN" ]; then
+            headers+=(-H "Authorization: Bearer ${AUTH_TOKEN}")
+          fi
+
+          # 用 jq 拼 JSON，避免中文引号、换行、反斜杠把请求体拼坏
+          payload=$(jq -n --arg body "$PAYLOAD_BODY" '{body: $body}')
+          echo "请求体：$payload"
+
+          # ---- 4. 发送 ----
+          # POST。--retry 只对连接层失败生效；不要加 --retry-all-errors，
+          # 否则 5xx 也会重发，可能导致服务端重复收到同一条内容。
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 10 --max-time 30 \
+            -X POST \
+            "${headers[@]}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$payload" \
+            -w '\nHTTP %{http_code} | 耗时 %{time_total}s\n' \
+            "$TARGET_URL"
