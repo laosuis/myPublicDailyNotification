@@ -4,7 +4,9 @@ on:
   schedule:
     # GitHub 的 cron 一律按 UTC 计算。北京时间 10:00 = UTC 02:00。
     # 中国无夏令时，全年固定这一个时间即可。
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * *"    # 北京 10:00
+    - cron: "0 4 * * *"    # 北京 12:00
+    - cron: "0 12 * * *"   # 北京 20:00
   # 允许在 Actions 页面手动点 Run 触发，方便首次验证
   workflow_dispatch:
 
